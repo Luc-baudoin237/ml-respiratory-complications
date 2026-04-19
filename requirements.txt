@@ -1,0 +1,10 @@
+numpy==1.26.4
+pandas==2.3.3
+scikit-learn==1.5.2
+scipy==1.12.0
+xgboost==3.2.0
+shap==0.45.1
+dcurves==1.1.7
+openpyxl
+matplotlib
+joblib
