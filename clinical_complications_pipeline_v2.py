@@ -2,6 +2,31 @@
 Clinical ML pipeline for predicting hospital complications in respiratory inpatients
 Tailored to: Respiratory diseases database eng.xlsx
 
+VERSION 3 — REVISION FOR REVIEWERS (October 2026)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Reproduces the revised manuscript. Changes from v2 (everything else unchanged):
+ R1. The six binary disease-category indicators (Tuberculosis, COPD exacerbation,
+     primary bronchial cancer, Pleuropulmonary metastases, Diffuse interstitial
+     pneumonia, Pulmonary vascular pathology) are no longer candidate predictors:
+     they derive from the final nosological classification and their availability
+     at admission cannot be verified per patient (49 predictors instead of 55).
+ R2. The Youden threshold is derived from out-of-fold (5-fold) predictions in the
+     TRAINING set and applied unchanged to the test set (v2 chose it on the test set).
+ R3. Calibration: Brier score, calibration intercept (calibration-in-the-large) and
+     slope, observed/expected ratio; PPV and NPV at the threshold.
+ R4. Sensitivity analyses reported in the manuscript / supplement:
+     - complete-case (SpO2 and respiratory rate recorded): re-trained models (as v2)
+       plus evaluation of the full-sample models, without re-training, in test
+       patients with / without both values;
+     - outcome definition: non-specific and admission-symptom-overlapping keywords
+       disregarded unless new onset is documented (variant A), and additionally
+       "respiratory assistance" kept only if admission O2 flow was 0 L/min (variant B);
+     - best models re-fitted without the 3 records coded male with postpartum = Yes.
+ R5. The 100-event threshold is no longer described as ensuring EPV >= 10.
+ R6. Figures: larger fonts; three-panel figures (A any, B severe, C respiratory).
+ R7. Data and output locations can be given on the command line:
+     python clinical_complications_pipeline_v3.py --data <xlsx> --out <folder>
+
 VERSION 2 — 10 CORRECTIONS APPLIQUÉES (Avril 2026):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔴 1. WinsorizerTransformer stateful (remplace FunctionTransformer — élimine data snooping)
@@ -25,6 +50,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from pathlib import Path
+import argparse
 import re
 import joblib
 import json
@@ -33,6 +59,9 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+# v3 (R6): larger text in all figures
+matplotlib.rcParams.update({"font.size": 13, "axes.titlesize": 14, "axes.labelsize": 13,
+                            "xtick.labelsize": 12, "ytick.labelsize": 12, "legend.fontsize": 11})
 
 from scipy import stats
 
@@ -44,7 +73,9 @@ from sklearn.metrics import (
     f1_score, roc_curve, brier_score_loss
 )
 from sklearn.calibration import calibration_curve
-from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_predict
+from sklearn.base import clone
+from sklearn.metrics import confusion_matrix
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
 from sklearn.feature_selection import VarianceThreshold
@@ -76,12 +107,17 @@ except Exception:
 # =========================================================
 
 BASE_DIR    = Path(__file__).resolve().parent
-DATA_PATH   = BASE_DIR / "Respiratory diseases database eng.xlsx"
+# v3 (R7): optional command-line locations (defaults identical to v2)
+_ap = argparse.ArgumentParser(add_help=True)
+_ap.add_argument("--data", default=str(BASE_DIR / "Respiratory diseases database eng.xlsx"))
+_ap.add_argument("--out",  default=str(BASE_DIR))
+_args, _ = _ap.parse_known_args()
+DATA_PATH   = Path(_args.data)
 SHEET_NAME  = 0
-OUTPUT_DIR  = BASE_DIR / "results"
+OUTPUT_DIR  = Path(_args.out) / "results"
 TABLE_DIR   = OUTPUT_DIR / "tables"
 FIG_DIR     = OUTPUT_DIR / "figures"
-MODEL_DIR   = BASE_DIR / "models"
+MODEL_DIR   = Path(_args.out) / "models"
 
 TABLE_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -92,7 +128,9 @@ TEST_SIZE     = 0.30
 N_SPLITS_CV   = 5
 N_BOOTSTRAP   = 1000
 
-# 🔴 CORRECTION 4 — Seuil minimum events (EPV < 10 avec ~50-80 features → min 100 events)
+# Minimum number of events for an outcome to be modelled (pre-specified rule).
+# v3 (R5): this threshold does NOT guarantee EPV >= 10 (e.g., 318 training events
+# for respiratory complication with 49 predictors, more parameters after one-hot encoding).
 MIN_EVENTS = 100
 
 # 🟢 CORRECTION 10 — Seeds pour repeated holdout
@@ -209,11 +247,42 @@ def map_any_complication(raw_complication, become_in_hospi, death):
     ).astype(int)
 
 
+KEYWORDS = {
+    "severe": [
+        "respiratory assistance", "transfer rea", "rea", "septic shock", "shock",
+        "altered consciousness", "alteration of consciousness", "confusional syndrome",
+        "acute renal failure", "anuria", "sepsis", "hemoptysis",
+        "severe respiratory distress", "respiratory distress", "oap",
+        "seizure", "tonic-clonic"
+    ],
+    "respiratory": [
+        "respiratory distress", "dyspnea", "paroxysmal dyspnea",
+        "respiratory assistance", "hemoptysis", "bronchial congestion",
+        "oap", "crackles", "respiratory"
+    ],
+    "neurological": [
+        "alteration of consciousness", "altered consciousness",
+        "altered state of consciousness", "confusional syndrome",
+        "hemiparesis", "seizure", "encephalopathy", "blurred vision"
+    ],
+    "infectious": [
+        "sepsis", "septic shock", "nosocomial", "infection",
+        "urinary tract infection", "fever", "persistence of fever", "pac"
+    ],
+    "hematologic": [
+        "anemia", "severe anemia", "decompensated anemia", "pancytopenia", "neutropenia"
+    ],
+    "renal": [
+        "acute renal failure", "acute functional renal failure",
+        "worsening of renal function", "anuria", "renal"
+    ],
+}
+
+
 def map_keyword_outcome(text_series, keywords):
     """
-    Map outcome based on keyword matching.
-    Keyword definitions validated by manual review of 50 random records
-    by a senior clinician (TRIPOD+AI recommendation).
+    Map outcome based on keyword matching (case-insensitive substring matching;
+    negation and event timing are not handled).
     """
     txt     = text_series.fillna("").astype(str).str.lower()
     pattern = "|".join(re.escape(k.lower()) for k in keywords)
@@ -250,34 +319,12 @@ def make_outcomes(df: pd.DataFrame) -> pd.DataFrame:
     become_text       = df.get(become_col,   pd.Series(index=df.index, dtype=object)).fillna("").astype(str).str.lower()
     death_text        = df.get(death_col,    pd.Series(index=df.index, dtype=object)).fillna("").astype(str).str.lower()
 
-    severe_keywords = [
-        "respiratory assistance", "transfer rea", "rea", "septic shock", "shock",
-        "altered consciousness", "alteration of consciousness", "confusional syndrome",
-        "acute renal failure", "anuria", "sepsis", "hemoptysis",
-        "severe respiratory distress", "respiratory distress", "oap",
-        "seizure", "tonic-clonic"
-    ]
-    respiratory_keywords = [
-        "respiratory distress", "dyspnea", "paroxysmal dyspnea",
-        "respiratory assistance", "hemoptysis", "bronchial congestion",
-        "oap", "crackles", "respiratory"
-    ]
-    neurological_keywords = [
-        "alteration of consciousness", "altered consciousness",
-        "altered state of consciousness", "confusional syndrome",
-        "hemiparesis", "seizure", "encephalopathy", "blurred vision"
-    ]
-    infectious_keywords = [
-        "sepsis", "septic shock", "nosocomial", "infection",
-        "urinary tract infection", "fever", "persistence of fever", "pac"
-    ]
-    hematologic_keywords = [
-        "anemia", "severe anemia", "decompensated anemia", "pancytopenia", "neutropenia"
-    ]
-    renal_keywords = [
-        "acute renal failure", "acute functional renal failure",
-        "worsening of renal function", "anuria", "renal"
-    ]
+    severe_keywords       = KEYWORDS["severe"]
+    respiratory_keywords  = KEYWORDS["respiratory"]
+    neurological_keywords = KEYWORDS["neurological"]
+    infectious_keywords   = KEYWORDS["infectious"]
+    hematologic_keywords  = KEYWORDS["hematologic"]
+    renal_keywords        = KEYWORDS["renal"]
 
     if "severe_complication" not in df.columns:
         df["severe_complication"] = (
@@ -379,8 +426,9 @@ def infer_column_groups(df: pd.DataFrame):
     # Ces variables ne reflètent pas l'état clinique à l'admission
     # → exclues a priori pour éviter un biais de sélection administrative
 
+    # v3 (R1): disease-category indicators are NOT candidate predictors (see get_leakage_columns)
     candidate_predictors = list(dict.fromkeys(
-        demographics + comorbidities + vitals + symptoms + labs + diagnosis
+        demographics + comorbidities + vitals + symptoms + labs
     ))
 
     return {
@@ -421,6 +469,9 @@ def get_leakage_columns(df: pd.DataFrame):
         "clinical form of tuberculosis", "TB location",
         "Specify the extrapulmonary location", "Tuberculosis Category",
         "Origin service", "Year of consultation",
+        # v3 (R1): disease-category indicators from the final nosological classification
+        "Pleuropulmonary metastases", "primary bronchial cancer", "Tuberculosis",
+        "Diffuse interstitial pneumonia", "Pulmonary vascular pathology", "COPD exacerbation",
         # HIV original — remplacé par HIV_positive + HIV_tested (correction 6)
         HIV_COL,
     ]
@@ -574,6 +625,29 @@ def find_optimal_threshold(y_true, y_prob):
     youden      = tpr - fpr
     optimal_idx = int(np.argmax(youden))
     return float(thresholds[optimal_idx]), float(youden[optimal_idx])
+
+
+def calibration_intercept_slope(y_true, y_prob):
+    """v3 (R3): calibration slope (logistic recalibration on the logit) and
+    calibration-in-the-large intercept (slope fixed at 1, logit as offset)."""
+    y_true = np.asarray(y_true)
+    p  = np.clip(np.asarray(y_prob), 1e-6, 1 - 1e-6)
+    lp = np.log(p / (1 - p))
+    slope = LogisticRegression(penalty=None).fit(lp.reshape(-1, 1), y_true).coef_[0][0]
+    a0 = 0.0
+    for _ in range(50):
+        q = 1 / (1 + np.exp(-(a0 + lp)))
+        a0 += (y_true - q).sum() / (q * (1 - q)).sum()
+    return float(a0), float(slope)
+
+
+def metrics_at_threshold(y_true, y_prob, threshold):
+    """v3 (R3): sensitivity, specificity, PPV, NPV, F1 at a fixed threshold."""
+    y_pred = (np.asarray(y_prob) >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return dict(sensitivity=tp / max(1, tp + fn), specificity=tn / max(1, tn + fp),
+                ppv=tp / max(1, tp + fp), npv=tn / max(1, tn + fn),
+                f1=f1_score(y_true, y_pred, zero_division=0), accuracy=(tp + tn) / len(y_pred))
 
 
 def calculate_ece(y_true, y_prob, n_bins=10):
@@ -777,8 +851,11 @@ def fit_and_evaluate_models(X, y, outcome_name, random_state=RANDOM_STATE):
         best_model = search.best_estimator_
 
         y_prob         = best_model.predict_proba(X_test)[:, 1]
-        optimal_thresh, youden_j = find_optimal_threshold(y_test, y_prob)
-        y_pred         = (y_prob >= optimal_thresh).astype(int)
+        # v3 (R2): threshold from out-of-fold TRAINING predictions, applied unchanged to the test set
+        oof_prob       = cross_val_predict(clone(best_model), X_train, y_train, cv=cv, method="predict_proba")[:, 1]
+        optimal_thresh, youden_j = find_optimal_threshold(y_train, oof_prob)
+        thr_metrics    = metrics_at_threshold(y_test.values, y_prob, optimal_thresh)
+        cal_int, cal_slope = calibration_intercept_slope(y_test.values, y_prob)
         test_auc       = roc_auc_score(y_test, y_prob)
         auc_mean, auc_lo, auc_hi = bootstrap_auc_ci(
             y_test.values, y_prob, n_bootstrap=N_BOOTSTRAP, random_state=random_state
@@ -795,13 +872,18 @@ def fit_and_evaluate_models(X, y, outcome_name, random_state=RANDOM_STATE):
             "auc_ci_upper":      round(auc_hi,   4),
             "cv_auc_mean":       round(cv_auc_mean, 4),
             "cv_auc_std":        round(cv_auc_std,  4),
-            "optimal_threshold": round(optimal_thresh, 4),
-            "youden_index":      round(youden_j, 4),
-            "accuracy":          round(accuracy_score(y_test, y_pred), 4),
-            "precision":         round(precision_score(y_test, y_pred, zero_division=0), 4),
-            "recall":            round(recall_score(y_test, y_pred, zero_division=0), 4),
-            "f1_score":          round(f1_score(y_test, y_pred, zero_division=0), 4),
+            "optimal_threshold": round(optimal_thresh, 4),   # v3: from OOF training predictions
+            "youden_index_train": round(youden_j, 4),
+            "accuracy":          round(thr_metrics["accuracy"], 4),
+            "sensitivity":       round(thr_metrics["sensitivity"], 4),
+            "specificity":       round(thr_metrics["specificity"], 4),
+            "ppv":               round(thr_metrics["ppv"], 4),
+            "npv":               round(thr_metrics["npv"], 4),
+            "f1_score":          round(thr_metrics["f1"], 4),
             "brier_score":       round(brier_score_loss(y_test, y_prob), 4),
+            "calibration_intercept": round(cal_int, 4),
+            "calibration_slope": round(cal_slope, 4),
+            "observed_expected": round(float(y_test.mean() / y_prob.mean()), 4),
             "ece":               round(ece, 4),
             "n_train":           len(y_train),
             "n_test":            len(y_test),
@@ -814,6 +896,7 @@ def fit_and_evaluate_models(X, y, outcome_name, random_state=RANDOM_STATE):
             "estimator": best_model,
             "X_train": X_train, "X_test": X_test,
             "y_train": y_train, "y_test": y_test,
+            "y_prob": y_prob,
         }
         fpr, tpr, _ = roc_curve(y_test, y_prob)
         roc_payload[name] = {"fpr": fpr, "tpr": tpr, "auc": test_auc}
@@ -1080,6 +1163,168 @@ def run_sensitivity_spO2_rr(X_all, work_df, main_perf_df, outcome_cols, modelled
 
 
 # =========================================================
+# v3 (R4) — COMPLETE-CASE DECOMPOSITION (no re-training)
+# =========================================================
+
+def run_complete_case_decomposition(work_df, best_fits):
+    """Evaluate the full-sample best models, WITHOUT re-training, in test patients with
+    both SpO2 and respiratory rate recorded and in those with either missing."""
+    mask = work_df["SpO2"].notna() & work_df["Respiratory rate"].notna()
+    rows = []
+    for outcome, bf in best_fits.items():
+        sel = mask.loc[bf["X_test"].index].values
+        for label, s_ in [("both_recorded", sel), ("either_missing", ~sel)]:
+            yy, pp = bf["y_test"].values[s_], bf["y_prob"][s_]
+            _, lo, hi = bootstrap_auc_ci(yy, pp, n_bootstrap=N_BOOTSTRAP, random_state=RANDOM_STATE)
+            rows.append({"outcome": outcome, "model": bf["name"], "test_subgroup": label,
+                         "n_test": int(s_.sum()), "events_test": int(yy.sum()),
+                         "prevalence": round(float(yy.mean()), 4),
+                         "auc": round(roc_auc_score(yy, pp), 4), "auc_ci_lower": round(lo, 4), "auc_ci_upper": round(hi, 4)})
+    out = pd.DataFrame(rows)
+    out.to_csv(TABLE_DIR / "sensitivity_SpO2_RR_no_retraining.csv", index=False)
+    print("  ✓ Complete-case decomposition saved: sensitivity_SpO2_RR_no_retraining.csv")
+    return out
+
+
+# =========================================================
+# v3 (R4) — OUTCOME-DEFINITION SENSITIVITY ANALYSIS
+# =========================================================
+
+OVERLAP_KEYWORDS = {"dyspnea": "Dyspnea", "paroxysmal dyspnea": "Dyspnea", "hemoptysis": "Hemoptysis",
+                    "fever": "Fever", "persistence of fever": "Fever"}
+NONSPECIFIC_KEYWORDS = {"respiratory"}
+INCIDENT_MARKERS = re.compile(r"exacerbation|worsening|installation|occurrence|onset|appearance|"
+                              r"\bon day\b|\bat day\b|\bday \d|\bnew\b")
+
+
+def relabel_outcomes(df, variant):
+    """Re-derive any/severe/respiratory complication at clause level.
+    variant 'none' reproduces the primary labels; 'A' disregards the non-specific keyword
+    'respiratory' and admission-symptom keywords unless new onset/worsening is documented
+    or the symptom was recorded as absent at admission; 'B' additionally keeps
+    'respiratory assistance' only if the admission O2 flow was 0 L/min.
+    Returns (labels DataFrame, audit DataFrame of disregarded mentions)."""
+    every_kw = sorted({k for v in KEYWORDS.values() for k in v})
+    comp   = df["Complication in hospital"].fillna("").astype(str).str.lower()
+    become = df["become in hospi"].fillna("").astype(str).str.strip().str.lower()
+    death  = df["Death"].fillna("").astype(str).str.strip().str.lower()
+    hard   = (become.isin(["death", "rea"]) | death.eq("yes")).values
+    o2     = df["O2 flow rate (in liters/min)"]
+
+    def reason(k, clause, idx):
+        if variant == "none":
+            return None
+        if k in NONSPECIFIC_KEYWORDS:
+            return "non-specific keyword 'respiratory'"
+        if k in OVERLAP_KEYWORDS:
+            adm = str(df.at[idx, OVERLAP_KEYWORDS[k]]).strip().lower()
+            if not INCIDENT_MARKERS.search(clause) and adm != "no":
+                return f"overlaps admission symptom ({OVERLAP_KEYWORDS[k]} at admission = {adm}); no evidence of new onset"
+        if k == "respiratory assistance" and variant == "B":
+            v = o2.at[idx]
+            if pd.isna(v) or v > 0:
+                return "respiratory assistance; admission O2 flow " + ("missing" if pd.isna(v) else f"{v:g} L/min")
+        return None
+
+    def join(reasons):
+        r = sorted({x for x in reasons if x})
+        if len(r) > 1:
+            r = [x for x in r if not x.startswith("non-specific")]
+        return " | ".join(r)
+
+    names = ["any_complication", "severe_complication", "respiratory_complication"]
+    out = {o: np.zeros(len(df), dtype=int) for o in names}
+    audit = []
+    for i, (idx, txt) in enumerate(comp.items()):
+        if not txt.strip():
+            out["severe_complication"][i] = out["any_complication"][i] = int(hard[i])
+            continue
+        any_ok = False
+        hit = {"severe": False, "respiratory": False}
+        for c in [c.strip() for c in re.split(r"[,;]| - | and ", txt)]:
+            if not c:
+                continue
+            matched = [k for k in every_kw if k in c]
+            why = {k: reason(k, c, idx) for k in matched}
+            kept = {k for k in matched if why[k] is None}
+            for name in hit:
+                m = [k for k in KEYWORDS[name] if k in c]
+                if any(k in kept for k in m):
+                    hit[name] = True
+                elif m:
+                    audit.append(dict(row=idx, text=txt, clause=c, outcome=f"{name}_complication",
+                                      keywords="; ".join(m), reason=join(why[k] for k in m)))
+            dropped = bool(matched) and not kept and any(k in OVERLAP_KEYWORDS or k == "respiratory assistance" for k in matched)
+            if dropped:
+                audit.append(dict(row=idx, text=txt, clause=c, outcome="any_complication",
+                                  keywords="; ".join(matched), reason=join(why.values())))
+            else:
+                any_ok = True
+        out["any_complication"][i] = int(any_ok or hard[i])
+        out["severe_complication"][i] = int(hit["severe"] or hard[i])
+        out["respiratory_complication"][i] = int(hit["respiratory"])
+    return pd.DataFrame(out, index=df.index), pd.DataFrame(audit)
+
+
+def run_outcome_definition_sensitivity(df, X_all, work_df, modelled_outcomes):
+    base, _ = relabel_outcomes(df, "none")
+    for o in modelled_outcomes:
+        assert int(base[o].sum()) == int(work_df[o].sum()), f"relabelling does not reproduce {o}"
+    perf, counts, audits = [], [], []
+    for v in ["A", "B"]:
+        lab, audit = relabel_outcomes(df, v)
+        audit.insert(0, "variant", v)
+        audits.append(audit)
+        for o in modelled_outcomes:
+            y = lab[o].rename(o)
+            counts.append({"variant": v, "outcome": o, "original": int(work_df[o].sum()), "sensitivity": int(y.sum()),
+                           "labels_removed": int(((work_df[o] == 1) & (y == 0)).sum())})
+            p, _, _, _ = fit_and_evaluate_models(X_all, y, f"{o}_definition{v}")
+            p.insert(0, "variant", v)
+            perf.append(p)
+    pd.DataFrame(counts).to_csv(TABLE_DIR / "sensitivity_outcome_definition_counts.csv", index=False)
+    pd.concat(audits).to_csv(TABLE_DIR / "sensitivity_outcome_definition_excluded_mentions.csv", index=False)
+    pd.concat(perf).to_csv(TABLE_DIR / "sensitivity_outcome_definition_performance.csv", index=False)
+    print("  ✓ Outcome-definition sensitivity saved: sensitivity_outcome_definition_*.csv")
+
+
+def run_postpartum_check(df, X_all, work_df, modelled_outcomes, best_model_names):
+    """Re-fit the best models without the records coded male with postpartum = Yes
+    (data-entry inconsistency under verification; records are NOT recoded)."""
+    flag = (df["Postpartum (<=6 weeks)"].astype(str).str.lower().eq("yes")
+            & df["Sex"].astype(str).str.lower().eq("male"))
+    keep = ~flag
+    print(f"  Records coded male with postpartum = Yes: {int(flag.sum())} (rows {df.index[flag].tolist()})")
+    rows = []
+    for o in modelled_outcomes:
+        p, _, _, _ = fit_and_evaluate_models(X_all[keep], work_df.loc[keep, o].astype(int), f"{o}_postpartum_check")
+        rows.append(p[p["model"] == best_model_names[o]])
+    pd.concat(rows).to_csv(TABLE_DIR / "sensitivity_postpartum_records_excluded.csv", index=False)
+    print("  ✓ Postpartum check saved: sensitivity_postpartum_records_excluded.csv")
+
+
+def compose_panels(files, out_name):
+    """v3 (R6): three-panel figure (A any, B severe, C respiratory) as in the manuscript."""
+    from PIL import Image, ImageDraw, ImageFont
+    ims = [Image.open(f).convert("RGB") for f in files]
+    h = max(i.height for i in ims)
+    ims = [i.resize((int(i.width * h / i.height), h)) for i in ims]
+    pad, top = 60, 170
+    canvas = Image.new("RGB", (sum(i.width for i in ims) + pad * 4, h + top + pad), "white")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype("arialbd.ttf", 130)
+    except Exception:
+        font = ImageFont.load_default()
+    x = pad
+    for label, im in zip("ABC", ims):
+        canvas.paste(im, (x, top)); draw.text((x, 20), label, font=font, fill="black"); x += im.width + pad
+    canvas.thumbnail((4500, 4500))
+    canvas.save(FIG_DIR / out_name, dpi=(300, 300))
+    print(f"  Saved panel figure: {FIG_DIR / out_name}")
+
+
+# =========================================================
 # 🟢 CORRECTION 10 — REPEATED HOLDOUT (5 SEEDS)
 # Quantifie la variance empirique de l'AUC test selon
 # la partition aléatoire train/test.
@@ -1152,7 +1397,7 @@ def run_repeated_holdout(X_all, work_df, modelled_outcomes, best_model_names):
 # =========================================================
 
 print("="*80)
-print("CLINICAL COMPLICATIONS ML PIPELINE — VERSION 2 (10 CORRECTIONS)")
+print("CLINICAL COMPLICATIONS ML PIPELINE — VERSION 3 (REVISION)")
 print("="*80)
 print()
 
@@ -1329,16 +1574,16 @@ all_perf        = []
 all_importance  = []
 all_shap        = []
 best_model_names = {}
+best_fits        = {}
 modelled_outcomes = []
 
 for outcome in outcome_cols:
     y        = work_df[outcome].astype(int)
     n_events = int(y.sum())
 
-    # 🔴 CORRECTION 4 — Seuil minimum: 100 events (EPV ≥ 10 requis pour ML stable)
+    # Pre-specified minimum of 100 events (v3 R5: not an EPV guarantee)
     if n_events < MIN_EVENTS:
-        print(f"\nSkipping {outcome}: n_events={n_events} < MIN_EVENTS={MIN_EVENTS} "
-              f"(EPV<10 avec ~{len(selected_predictors)} features)")
+        print(f"\nSkipping {outcome}: n_events={n_events} < MIN_EVENTS={MIN_EVENTS}")
         continue
 
     print(f"\n{'='*80}")
@@ -1352,6 +1597,7 @@ for outcome in outcome_cols:
     perf_df.to_csv(TABLE_DIR / f"performance_{outcome}.csv", index=False)
     all_perf.append(perf_df)
     best_model_names[outcome] = best_name
+    best_fits[outcome] = dict(best_fit, name=best_name)
 
     # Sauvegarder le pipeline entraîné pour les 3 outcomes principaux
     if outcome in ["severe_complication", "respiratory_complication", "any_complication"]:
@@ -1410,40 +1656,58 @@ sensitivity_df = run_sensitivity_spO2_rr(
     X_all, work_df, main_perf_df, outcome_cols, modelled_outcomes
 )
 
+# v3 (R4) — complete-case decomposition without re-training
+cc_decomp_df = run_complete_case_decomposition(work_df, best_fits)
+
 # 🟢 CORRECTION 10 — Repeated holdout (5 seeds)
 holdout_df = run_repeated_holdout(
     X_all, work_df, modelled_outcomes, best_model_names
 )
 
+# v3 (R4) — outcome-definition sensitivity analysis and postpartum check
+run_outcome_definition_sensitivity(df, X_all, work_df, modelled_outcomes)
+run_postpartum_check(df, X_all, work_df, modelled_outcomes, best_model_names)
+
+# v3 (R6) — three-panel manuscript figures (Figures 2-5)
+_order = ["any_complication", "severe_complication", "respiratory_complication"]
+if all(o in best_model_names for o in _order):
+    compose_panels([FIG_DIR / f"roc_{o}.png" for o in _order], "Figure2_ROC.png")
+    compose_panels([FIG_DIR / f"importance_{o}.png" for o in _order], "Figure3_importance.png")
+    compose_panels([FIG_DIR / f"shap_summary_{o}.png" for o in _order], "Figure4_SHAP.png")
+    compose_panels([FIG_DIR / f"calibration_{o}_{best_model_names[o]}.png" for o in _order], "Figure5_calibration.png")
+
 # ── 8. RAPPORT FINAL ───────────────────────────────────────────────────────
 print("\n" + "="*80)
-print("PIPELINE COMPLETED SUCCESSFULLY — VERSION 2")
+print("PIPELINE COMPLETED SUCCESSFULLY — VERSION 3")
 print("="*80)
 print(f"\nResults saved to: {OUTPUT_DIR}")
 print("\nMain tables for manuscript:")
 print("  table1_baseline_characteristics.csv")
 print("  table2_distribution_of_complications.csv")
-print("  table3_model_performance.csv       [AUC, 95%CI, CV AUC±SD, ECE, Youden]")
+print("  table3_model_performance.csv       [AUC, 95%CI, CV AUC±SD, threshold metrics (OOF training threshold), Brier, calibration, ECE]")
 print("  table4_top_predictors_of_complications.csv")
 print("\nSensitivity / Supplementary tables:")
 print("  sensitivity_SpO2_RR.csv            [Correction 9]")
 print("  repeated_holdout_5seeds.csv        [Correction 10]")
+print("  sensitivity_SpO2_RR_no_retraining.csv  [v3]")
+print("  sensitivity_outcome_definition_*.csv   [v3]")
+print("  sensitivity_postpartum_records_excluded.csv [v3]")
 print("  correlation_threshold_sensitivity.csv")
 print("\nFigures:")
 for p in sorted(FIG_DIR.glob("*.png")):
     print(f"  {p.name}")
 
 print("\n" + "="*80)
-print("10 CORRECTIONS APPLIED:")
+print("v2 CORRECTIONS (v3 changes R1–R7 are listed in the file header):")
 print("="*80)
 print("🔴 1. WinsorizerTransformer stateful          — zero data snooping on test set")
 print("🔴 2. XGBoost scale_pos_weight from train set — fair model comparison")
 print("🔴 3. Payment method + IMD excluded           — no administrative predictors")
-print(f"🔴 4. MIN_EVENTS={MIN_EVENTS}                        — EPV<10 outcomes excluded")
+print(f"🔴 4. MIN_EVENTS={MIN_EVENTS}                        — outcomes with <100 events not modelled")
 print("🟡 5. Hemoglobin Tx parsed with regex         — continuous variable correctly encoded")
 print("🟡 6. HIV → HIV_positive + HIV_tested         — clinically interpretable encoding")
 print("🟡 7. SHAP on full test set                   — stable feature importance")
 print("🟡 8. Correlation filter consistent           — same dataset compute & apply")
-print("🟢 9. Sensitivity SpO2+RR observed subset     — imputation robustness confirmed")
+print("🟢 9. Sensitivity SpO2+RR observed subset     — complete-case re-training (not an imputation-only comparison)")
 print("🟢 10. Repeated holdout 5 seeds               — empirical AUC variance quantified")
 print("="*80)
